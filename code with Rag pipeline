@@ -1,0 +1,184 @@
+import openai
+import pinecone
+from sentence_transformers import SentenceTransformer
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.common.keys import Keys
+from webdriver_manager.chrome import ChromeDriverManager
+from bs4 import BeautifulSoup
+import pandas as pd
+import time
+from datetime import datetime, timedelta
+from dateutil.parser import parse as parse_date
+from sqlalchemy import create_engine
+import re
+
+# Setup OpenAI and Pinecone
+openai.api_key = 'your_openai_api_key'
+pinecone.init(api_key="your_pinecone_api_key", environment="us-west1-gcp")
+embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+
+# Initialize Pinecone index
+index_name = "job-listings-index"
+if index_name not in pinecone.list_indexes():
+    pinecone.create_index(index_name, dimension=384)  # 384 for 'all-MiniLM-L6-v2'
+index = pinecone.Index(index_name)
+
+def parse_posted_date(posted_date_str, reference_date):
+    """Parse the posted date string from Indeed job listings."""
+    try:
+        if 'day' in posted_date_str:
+            days_ago = int(re.search(r'\d+', posted_date_str).group())
+            return reference_date - timedelta(days=days_ago)
+        elif 'hour' in posted_date_str:
+            hours_ago = int(re.search(r'\d+', posted_date_str).group())
+            return reference_date - timedelta(hours=hours_ago)
+        elif 'minute' in posted_date_str:
+            minutes_ago = int(re.search(r'\d+', posted_date_str).group())
+            return reference_date - timedelta(minutes=minutes_ago)
+        elif 'second' in posted_date_str:
+            seconds_ago = int(re.search(r'\d+', posted_date_str).group())
+            return reference_date - timedelta(seconds=seconds_ago)
+        elif 'Just posted' in posted_date_str or 'Today' in posted_date_str:
+            return reference_date
+        elif re.match(r'\d{1,2} [A-Za-z]{3} \d{4}', posted_date_str):  # Check for structured date format
+            return datetime.strptime(posted_date_str, "%d %b %Y")
+        else:
+            return parse_date(posted_date_str, default=reference_date)
+    except Exception as e:
+        print(f"Error parsing date: {e}, original date string: {posted_date_str}")
+        return None
+
+def scrape_and_store_jobs(query, location):
+    driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()))
+
+    titles = []
+    companies = []
+    locations = []
+    posted_dates = []
+
+    now = datetime.now()
+    last_24_hours = now - timedelta(hours=24)
+
+    page = 0
+    while True:
+        url = f'https://in.indeed.com/jobs?q={query}&l={location}&start={page}'
+        driver.get(url)
+        time.sleep(2)
+
+        body = driver.find_element(By.CSS_SELECTOR, 'body')
+        for _ in range(10):
+            body.send_keys(Keys.PAGE_DOWN)
+            time.sleep(0.5)
+
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        job_elements = soup.find_all('div', class_='job_seen_beacon')
+
+        if not job_elements:
+            break
+
+        for job_elem in job_elements:
+            title_elem = job_elem.find('h2', class_='jobTitle')
+            company_elem = job_elem.find('span', class_='companyName')
+            location_elem = job_elem.find('div', class_='companyLocation')
+            date_elem = job_elem.find('span', class_='css-qvloho eu4oa1w0')
+
+            if not all([title_elem, company_elem, location_elem, date_elem]):
+                continue
+
+            title = title_elem.text.strip()
+            company = company_elem.text.strip()
+            location = location_elem.text.strip()
+            posted_date = date_elem.text.strip()
+
+            posted_datetime = parse_posted_date(posted_date, now)
+            print(f"Original Posted Date: {posted_date}, Parsed Posted Date: {posted_datetime}")
+
+            if posted_datetime and posted_datetime >= last_24_hours:
+                titles.append(title)
+                companies.append(company)
+                locations.append(location)
+                posted_dates.append(posted_datetime)
+
+                print(f"Job Title: {title}")
+                print(f"Company: {company}")
+                print(f"Location: {location}")
+                print(f"Posted Date: {posted_date}")
+                print()
+
+                if len(titles) >= 30:
+                    break
+        if len(titles) >= 30:
+            break
+
+    driver.quit()
+
+    # Create DataFrame
+    job_data = pd.DataFrame({
+        'Job Title': titles,
+        'Company': companies,
+        'Location': locations,
+        'Posted Date': posted_dates
+    })
+
+    # Filter jobs from the last 24 hours
+    df_filtered = job_data[job_data['Posted Date'] >= last_24_hours]
+
+    # Store the job data in a MySQL database
+    engine = create_engine('mysql+pymysql://root:your_password@127.0.0.1:3306/your_db')
+    df_filtered.to_sql('past_24hrsnew', engine, if_exists='replace', index=False)
+
+    # Store embeddings in Pinecone
+    store_job_data_in_pinecone(df_filtered)
+
+    return df_filtered
+
+def store_job_data_in_pinecone(job_data):
+    """Store job data in Pinecone as vector embeddings."""
+    embeddings = embedding_model.encode(job_data['Job Title'] + job_data['Company'] + job_data['Location'])
+
+    for i, (title, company, location, embedding) in enumerate(zip(job_data['Job Title'], job_data['Company'], job_data['Location'], embeddings)):
+        text = f"Job Title: {title}\nCompany: {company}\nLocation: {location}"
+        index.upsert([(f"job_{i}", embedding.tolist(), {'text': text})])
+
+    print("Data stored in Pinecone successfully.")
+
+def query_and_generate_response(query):
+    """Query Pinecone and generate a response using OpenAI."""
+    query_embedding = embedding_model.encode([query])[0]
+
+    # Perform similarity search in Pinecone
+    result = index.query(query_embedding.tolist(), top_k=3, include_metadata=True)
+
+    # Collect relevant chunks of text
+    relevant_chunks = [item['metadata']['text'] for item in result['matches']]
+
+    # Generate a response using OpenAI GPT-3 or GPT-4
+    context = "\n".join(relevant_chunks)
+    prompt = f"Answer the following question based on the context:\n{context}\n\nQuestion: {query}"
+
+    response = openai.Completion.create(
+        engine="text-davinci-003",  # or use "gpt-4" if available
+        prompt=prompt,
+        max_tokens=500,
+        temperature=0.7,
+    )
+
+    return response.choices[0].text.strip()
+
+if __name__ == "__main__":
+    query = 'python developer'
+    location = 'India'
+
+    try:
+        job_df = scrape_and_store_jobs(query, location)
+        print("\nDataFrame Output:")
+        print(job_df)
+
+        # Example user query
+        user_query = "What are the requirements for a Python developer job?"
+        response = query_and_generate_response(user_query)
+        print(f"Response: {response}")
+    except Exception as e:
+        print(f"An error occurred: {e}")
