@@ -1,0 +1,468 @@
+Code 1: Scrape Indeed Job Titles and Posted Dates from the Last 24 Hours and Save to MySQL
+This code is a web scraping script that collects job data from the Indeed platform using Selenium for automation and BeautifulSoup for parsing the HTML. The script searches for jobs based on a given query (e.g., "python developer") and location (e.g., "India"). The scrape_indeed_jobs() function is the core, where the program initializes a Selenium Chrome driver to interact with the webpage. It navigates through multiple pages, extracts job titles and posting dates, and filters them to keep only those posted within the last 24 hours. The parsed data (job title and posted date) is stored in a Pandas DataFrame, which is then saved to a MySQL database using SQLAlchemy. The script also includes a helper function, parse_posted_date(), that converts various date formats into a standard datetime format. This function uses regular expressions and logic to handle phrases like "posted 2 days ago" or "Just posted."
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.common.keys import Keys
+from webdriver_manager.chrome import ChromeDriverManager
+from bs4 import BeautifulSoup
+import pandas as pd
+import time
+from datetime import datetime, timedelta
+from dateutil.parser import parse as parse_date
+from sqlalchemy import create_engine
+import re
+
+def parse_posted_date(posted_date_str, reference_date):
+    """Parse the posted date string from Indeed job listings."""
+    try:
+        if 'day' in posted_date_str:
+            days_ago = int(re.search(r'\d+', posted_date_str).group())
+            return reference_date - timedelta(days=days_ago)
+        elif 'hour' in posted_date_str:
+            hours_ago = int(re.search(r'\d+', posted_date_str).group())
+            return reference_date - timedelta(hours=hours_ago)
+        elif 'minute' in posted_date_str:
+            minutes_ago = int(re.search(r'\d+', posted_date_str).group())
+            return reference_date - timedelta(minutes=minutes_ago)
+        elif 'second' in posted_date_str:
+            seconds_ago = int(re.search(r'\d+', posted_date_str).group())
+            return reference_date - timedelta(seconds=seconds_ago)
+        elif 'Just posted' in posted_date_str or 'Today' in posted_date_str:
+            return reference_date
+        elif re.match(r'\d{1,2} [A-Za-z]{3} \d{4}', posted_date_str):  # Check for structured date format
+            return datetime.strptime(posted_date_str, "%d %b %Y")
+        else:
+            return parse_date(posted_date_str, default=reference_date)
+    except Exception as e:
+        print(f"Error parsing date: {e}, original date string: {posted_date_str}")
+        return None
+
+def scrape_indeed_jobs(query, location):
+    driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()))
+
+    titles = []
+    posted_dates = []
+
+    now = datetime.now()
+    last_24_hours = now - timedelta(hours=24)
+
+    page = 0
+    while True:
+        url = f'https://in.indeed.com/jobs?q={query}&l={location}&start={page}'
+        driver.get(url)
+        time.sleep(2)  
+
+        body = driver.find_element(By.CSS_SELECTOR, 'body')
+        for _ in range(10):
+            body.send_keys(Keys.PAGE_DOWN)
+            time.sleep(0.5)  
+
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+        
+        job_elements = soup.find_all('div', class_='job_seen_beacon')
+        
+        if not job_elements:
+            break
+
+        for job_elem in job_elements:
+            title_elem = job_elem.find('h2', class_='jobTitle')
+            date_elem = job_elem.find('span', class_='css-qvloho eu4oa1w0')
+
+            if not all([title_elem, date_elem]):
+                continue 
+
+            title = title_elem.text.strip()
+            posted_date = date_elem.text.strip()
+
+            posted_datetime = parse_posted_date(posted_date, now)
+            print(f"Original Posted Date: {posted_date}, Parsed Posted Date: {posted_datetime}")
+
+            if posted_datetime and posted_datetime >= last_24_hours:
+                titles.append(title)
+                posted_dates.append(posted_datetime)
+
+                print(f"Job Title: {title}")
+                print(f"Posted Date: {posted_date}")
+                print()
+
+                if len(titles) >= 30:
+                    break
+        if len(titles) >= 30:
+            break
+
+    driver.quit()
+
+    df = pd.DataFrame({
+        'Job Title': titles,
+        'Posted Date': posted_dates
+    })
+
+    df_filtered = df[df['Posted Date'] >= last_24_hours]
+
+    engine = create_engine('mysql+pymysql://root:jahnavis%403110@127.0.0.1:3306/24hrsnew')
+    df_filtered.to_sql('past_24hrsnew', engine, if_exists='replace', index=False)
+
+    return df_filtered
+
+if __name__ == "__main__":
+    query = 'python developer'  
+    location = 'India'  
+
+    try:
+        job_df = scrape_indeed_jobs(query, location)
+        print("\nDataFrame Output:")
+        print(job_df)
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+
+
+Code 2: Scrape Indeed Job Listings with Date Parsing, Filter by Last 24 Hours, and Save to MySQL
+
+It is a more advanced version of the previous scrapers, adding a feature for date parsing. The main function, scrape_indeed_jobs(), works similarly to the other scripts but also parses the posted date of each job listing. The function uses parse_posted_date(), which interprets various time-related strings like "2 days ago" or "Just posted," converting them into datetime objects for further processing. The jobs are filtered to keep only those posted within the last 24 hours. The script scrapes job titles, company names, locations, salaries, and posted dates, and stores the results in a Pandas DataFrame. The data is then saved into a MySQL database using SQLAlchemy. This code also differentiates between employer-active and posted jobs to avoid incorrect parsing.
+
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.common.keys import Keys
+from webdriver_manager.chrome import ChromeDriverManager
+from bs4 import BeautifulSoup
+import pandas as pd
+import time
+from datetime import datetime, timedelta
+from dateutil.parser import parse as parse_date
+from sqlalchemy import create_engine
+
+def parse_posted_date(posted_date_str, reference_date):
+    """Parse the posted date string from Indeed job listings."""
+    try:
+        if posted_date_str is None:
+            return None
+
+        if 'EmployerActive' in posted_date_str or 'PostedPosted' in posted_date_str:
+            # Skip entries with 'EmployerActive' or 'PostedPosted'
+            return None
+
+        if 'day' in posted_date_str:
+            days_ago = int(posted_date_str.split()[0])
+            return reference_date - timedelta(days=days_ago)
+        elif 'hour' in posted_date_str:
+            hours_ago = int(posted_date_str.split()[0])
+            return reference_date - timedelta(hours=hours_ago)
+        elif 'minute' in posted_date_str:
+            minutes_ago = int(posted_date_str.split()[0])
+            return reference_date - timedelta(minutes=minutes_ago)
+        elif 'second' in posted_date_str:
+            seconds_ago = int(posted_date_str.split()[0])
+            return reference_date - timedelta(seconds=seconds_ago)
+        else:
+            # Handle "Just posted", "Today", or any other cases as needed
+            if 'Just' in posted_date_str or 'Today' in posted_date_str:
+                return reference_date
+            return parse_date(posted_date_str, default=reference_date)
+    except Exception as e:
+        print(f"Error parsing date: {e}, original date string: {posted_date_str}")
+        return None
+
+def scrape_indeed_jobs(query, location):
+    # Initialize the Chrome driver
+    driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()))
+
+    # Initialize empty lists to store job details
+    titles = []
+    companies = []
+    locations = []
+    salaries = []
+    posted_dates = []
+
+    now = datetime.now()
+    last_24_hours = now - timedelta(hours=24)
+    
+    page = 0
+    while True:  # Loop until no more jobs are found
+        # Construct the URL based on the query and location
+        url = f'https://in.indeed.com/jobs?q={query}&l={location}&start={page}'
+        
+        # Open the URL
+        driver.get(url)
+        time.sleep(5)  # Wait for the page to load
+        
+        # Scroll to load dynamic content if necessary
+        body = driver.find_element(By.CSS_SELECTOR, 'body')
+        previous_height = driver.execute_script("return document.body.scrollHeight")
+        
+        while True:
+            body.send_keys(Keys.PAGE_DOWN)
+            time.sleep(1)  # Slight delay to allow content to load
+            new_height = driver.execute_script("return document.body.scrollHeight")
+            
+            if new_height == previous_height:
+                break
+            previous_height = new_height
+
+        # Parse the page source with BeautifulSoup
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+
+        # Find all job listings on the page
+        job_elements = soup.find_all('div', class_='job_seen_beacon')
+
+        if not job_elements:
+            break
+
+        # Extract job details from each job element
+        for job_elem in job_elements:
+            # Extract job title
+            title_elem = job_elem.find('h2', class_='jobTitle')
+            title = title_elem.text.strip() if title_elem else 'N/A'
+            titles.append(title)
+            print(f"Job Title: {title}")
+
+            # Extract company name
+            company_elem = job_elem.find('span', class_='css-63koeb eu4oa1w0')
+            company = company_elem.text.strip() if company_elem else 'N/A'
+            companies.append(company)
+            print(f"Company: {company}")
+
+            # Extract job location
+            location_elem = job_elem.find('div', class_='css-1p0sjhy eu4oa1w0')
+            location = location_elem.text.strip() if location_elem else 'N/A'
+            locations.append(location)
+            print(f"Location: {location}")
+
+            # Extract job salary
+            salary_elem = job_elem.find('div', class_='metadata salary-snippet-container css-5zy3wz eu4oa1w0')
+            salary = salary_elem.text.strip() if salary_elem else 'N/A'
+            salaries.append(salary)
+            print(f"Salary: {salary}")
+
+            # Extract posted date (if available)
+            date_elem = job_elem.find('span', class_='css-qvloho eu4oa1w0')
+            posted_date = date_elem.text.strip() if date_elem else 'N/A'
+            posted_dates.append(posted_date)
+            print(f"Posted Date: {posted_date}")
+
+        if len(job_elements) < 15:  # Assuming each page has 15 job listings, adjust if needed
+            break
+
+        page += 10  # Move to the next page
+
+    # Close the driver
+    driver.quit()
+
+    # Create a DataFrame using pandas
+    df = pd.DataFrame({
+        'Job Title': titles,
+        'Company': companies,
+        'Location': locations,
+        'Salary': salaries,
+        'Posted Date': posted_dates
+    })
+
+    # Remove rows where Job Title is 'N/A'
+    df = df[df['Job Title'] != 'N/A']
+
+    # Convert 'Posted Date' to datetime using parsed dates
+    df['Parsed Posted Date'] = df['Posted Date'].apply(lambda x: parse_posted_date(x, now))
+
+    # Debugging: Print parsed dates
+    print("\nParsed Posted Dates:")
+    print(df[['Posted Date', 'Parsed Posted Date']])
+
+    # Connect to MySQL database
+    engine = create_engine('mysql+pymysql://root:jahnavis%403110@127.0.0.1:3306/indeed')
+
+    # Save to MySQL table 'all_time'
+    df.to_sql('all_time', engine, if_exists='replace', index=False)
+
+    # Filter jobs posted in the last 24 hours
+    df_filtered = df[df['Parsed Posted Date'] >= last_24_hours]
+
+    # Debugging: Print filtered DataFrame
+    print("\nFiltered DataFrame (Past 24 Hours):")
+    print(df_filtered)
+
+    # Save to MySQL table 'past_24hrs'
+    df_filtered.to_sql('past_24hrs', engine, if_exists='replace', index=False)
+
+    return df, df_filtered
+
+if __name__ == "__main__":
+    query = 'python developer'  # Example query: Python developer
+    location = 'India'  # Example location: India
+
+    try:
+        all_time_df, past_24hrs_df = scrape_indeed_jobs(query, location)
+        print("\nDataFrame Output (All Time):")
+        print(all_time_df)
+
+        print("\nDataFrame Output (Past 24 Hours):")
+        print(past_24hrs_df)
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+
+
+Code 3: Scrape Indeed Job Titles, Companies, Locations, and Salaries, and Save to Excel
+
+It is a simplified scraper for Indeed job listings, designed to collect job titles, company names, locations, and salaries from multiple pages. The Selenium driver is used to navigate the Indeed website and BeautifulSoup parses the job listings. The script iterates through multiple pages, extracting relevant job details from each one. Once the scraping is complete, the collected data is saved to an Excel file using Pandas. The code includes pagination support and handles dynamic content loading with page down scrolling. This script offers a straightforward solution for scraping and saving job data in an Excel file without saving it to a database.
+
+
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service as ChromeService
+from selenium.webdriver.common.keys import Keys
+from webdriver_manager.chrome import ChromeDriverManager
+from bs4 import BeautifulSoup
+import pandas as pd
+import time
+
+def scrape_indeed_jobs(query, location, max_pages=5):
+    # Initialize the Chrome driver
+    driver = webdriver.Chrome(service=ChromeService(ChromeDriverManager().install()))
+
+    # Initialize empty lists to store job details
+    titles = []
+    companies = []
+    locations = []
+    salaries = []
+
+    for page in range(0, max_pages * 10, 10):  # Pagination: each page increments by 10
+        # Construct the URL based on the query and location
+        url = f'https://in.indeed.com/jobs?q={query}&l={location}&start={page}'
+
+        # Open the URL
+        driver.get(url)
+        time.sleep(2)  # Wait for the page to load
+
+        # Scroll to load dynamic content if necessary
+        body = driver.find_element(By.CSS_SELECTOR, 'body')
+        for _ in range(10):
+            body.send_keys(Keys.PAGE_DOWN)
+            time.sleep(0.5)  # Slight delay to allow content to load
+
+        # Parse the page source with BeautifulSoup
+        soup = BeautifulSoup(driver.page_source, 'html.parser')
+
+        # Find all job listings on the page
+        job_elements = soup.find_all('div', class_='job_seen_beacon')
+
+        # Extract job details from each job element
+        for job_elem in job_elements:
+            # Extract job title
+            title_elem = job_elem.find('h2', class_='jobTitle')
+            title = title_elem.text.strip() if title_elem else 'N/A'
+            titles.append(title)
+            print(f"Job Title: {title}")
+
+            # Extract company name
+            company_elem = job_elem.find('span', class_='css-63koeb eu4oa1w0')
+            company = company_elem.text.strip() if company_elem else 'N/A'
+            companies.append(company)
+            print(f"Company: {company}")
+
+            # Extract job location
+            location_elem = job_elem.find('div', class_='css-1p0sjhy eu4oa1w0')
+            location = location_elem.text.strip() if location_elem else 'N/A'
+            locations.append(location)
+            print(f"Location: {location}")
+
+            # Extract job salary
+            salary_elem = job_elem.find('div', class_='metadata salary-snippet-container css-5zy3wz eu4oa1w0')
+            salary = salary_elem.text.strip() if salary_elem else 'N/A'
+            salaries.append(salary)
+            print(f"Salary: {salary}")
+
+            if len(titles) >= 60:
+                break
+        if len(titles) >= 60:
+            break
+
+
+    # Close the driver
+    driver.quit()
+
+    # Create a DataFrame using pandas
+    df = pd.DataFrame({
+        'Job Title': titles,
+        'Company': companies,
+        'Location': locations,
+        'Salary': salaries
+    })
+
+    # Save the DataFrame to an Excel file
+    df.to_excel('scraped_indeed_jobs.xlsx', index=False)
+
+    return df
+
+# Example usage:
+if __name__ == "__main__":
+    query = 'python+developer'  # Example query: Python developer
+    location = 'Bengaluru%2C+Karnataka'  # Example location: Bengaluru, Karnataka
+
+    # Scrape job listings from Indeed
+    try:
+        job_df = scrape_indeed_jobs(query, location)
+        print("\nDataFrame Output:")
+        print(job_df)
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+
+
+Code 4 : Insert Scraped Job Data from Excel into MySQL Database
+
+This code handles insertion of job data into a MySQL database after reading data from an Excel file. It first loads the data from an Excel file using Pandas, then connects to a MySQL database with the provided credentials. The code uses MySQL Connector to interact with the database. It creates a table if it does not exist and proceeds to insert each row of the Excel file into the job_listings table. Each job's title, company, location, and salary are stored as separate columns. The script also handles error handling to ensure smooth database interaction and closes the connection once the insertion is complete. This code is mainly focused on data insertion into MySQL after scraping and storing the data in an Excel file.
+
+import pandas as pd
+import mysql.connector
+
+# Load Excel file into pandas DataFrame
+excel_file = 'scraped_indeed_jobs.xlsx'
+df = pd.read_excel(excel_file)
+
+# MySQL Connection parameters
+db_config = {
+    'host': 'localhost',
+    'port': 3306,
+    'user': 'root',
+    'password': 'jahnavis@3110',
+    'database': 'jahnavidb'
+}
+
+# Connect to MySQL
+try:
+    conn = mysql.connector.connect(**db_config)
+    cursor = conn.cursor()
+
+    # Create table if it doesn't exist
+    create_table_query = """
+    CREATE TABLE IF NOT EXISTS job_listings (
+        Job_Title VARCHAR(255),
+        Company VARCHAR(255),
+        Location VARCHAR(255),
+        Salary VARCHAR(255)
+    )
+    """
+    cursor.execute(create_table_query)
+    print("Table created successfully or already exists.")
+
+    # Insert data into MySQL
+    for index, row in df.iterrows():
+        sql = "INSERT INTO job_listings (Job_Title, Company, Location, Salary) VALUES (%s, %s, %s, %s)"
+        values = (row['Job Title'], row['Company'], row['Location'], row['Salary'])
+        cursor.execute(sql, values)
+
+    conn.commit()
+    print("Data inserted successfully!")
+
+except mysql.connector.Error as err:
+    print(f"Error: {err}")
+
+finally:
+    if 'conn' in locals() and conn.is_connected():
+        cursor.close()
+        conn.close()
