@@ -1,0 +1,113 @@
+import os
+import fitz  # PyMuPDF for PDF text extraction
+from sentence_transformers import SentenceTransformer
+from pinecone import Pinecone, ServerlessSpec
+from langchain.llms import OpenAI
+from langchain.prompts import PromptTemplate
+from datetime import datetime
+
+# Initialize Pinecone
+def init_pinecone(api_key: str, environment: str, index_name: str, dimension: int):
+    pc = Pinecone(api_key=api_key)
+    if index_name not in pc.list_indexes().names():
+        pc.create_index(
+            name=index_name,
+            dimension=dimension,
+            metric="cosine",
+            spec=ServerlessSpec(cloud="aws", region=environment)
+        )
+    return pc.Index(index_name)
+
+# Extract text from PDF
+def extract_pdf_text(pdf_path: str):
+    text_data = {}
+    with fitz.open(pdf_path) as pdf:
+        for page_num in range(len(pdf)):
+            page = pdf[page_num]
+            text_data[page_num + 1] = page.get_text()
+    return text_data
+
+# Chunk text into smaller segments
+def chunk_text(text: str, max_chunk_size: int = 512):
+    words = text.split()
+    return [
+        " ".join(words[i:i + max_chunk_size]) for i in range(0, len(words), max_chunk_size)
+    ]
+
+# Store embeddings in Pinecone
+def store_embeddings(pinecone_index, model, pdf_data):
+    for page_num, text in pdf_data.items():
+        chunks = chunk_text(text)
+        for i, chunk in enumerate(chunks):
+            embedding = model.encode(chunk)
+            pinecone_index.upsert([
+                {
+                    "id": f"page-{page_num}-{i}",
+                    "values": embedding,
+                    "metadata": {"text": chunk, "page": page_num}
+                }
+            ])
+
+# Query Pinecone for relevant chunks
+def query_pinecone(pinecone_index, model, query, top_k=5):
+    query_embedding = model.encode(query)
+    return pinecone_index.query(query_embedding, top_k=top_k, include_metadata=True)
+
+# Generate response using LLM
+def generate_response(llm, query, retrieved_chunks):
+    context = "\n".join(chunk["metadata"]["text"] for chunk in retrieved_chunks)
+    prompt = f"Context:\n{context}\n\nQuestion: {query}\nAnswer:"
+    return llm(prompt)
+
+# Main pipeline
+def pdf_chat_pipeline(pdf_path, query, pinecone_api_key, pinecone_env, pinecone_index_name):
+    # Initialize the model and Pinecone
+    embedding_model = SentenceTransformer('all-MiniLM-L6-v2')
+    pinecone_index = init_pinecone(
+        api_key=pinecone_api_key,
+        environment=pinecone_env,
+        index_name=pinecone_index_name,
+        dimension=embedding_model.get_sentence_embedding_dimension()
+    )
+    
+    # Extract text from PDF
+    print(f"[{datetime.now()}] Extracting text from {pdf_path}...")
+    pdf_data = extract_pdf_text(pdf_path)
+
+    # Store embeddings in Pinecone
+    print(f"[{datetime.now()}] Storing embeddings...")
+    store_embeddings(pinecone_index, embedding_model, pdf_data)
+
+    # Query processing
+    print(f"[{datetime.now()}] Processing query: {query}")
+    retrieved_chunks = query_pinecone(pinecone_index, embedding_model, query)
+
+    # Generate response using LLM
+    llm = OpenAI(temperature=0.7)
+    response = generate_response(llm, query, retrieved_chunks)
+
+    print(f"[{datetime.now()}] Response generated:\n{response}")
+
+    return response
+
+# Example usage
+if __name__ == "__main__":
+    # Replace these variables with your project-specific values
+    PDF_PATH = "path/to/your/pdf_file.pdf"  # Path to the PDF file
+    QUERY = "What is the unemployment information for Bachelor's degrees?"
+    PINECONE_API_KEY = "your_pinecone_api_key"
+    PINECONE_ENV = "us-west1"
+    PINECONE_INDEX_NAME = "pdf_chat_index"
+
+    try:
+        response = pdf_chat_pipeline(
+            pdf_path=PDF_PATH,
+            query=QUERY,
+            pinecone_api_key=PINECONE_API_KEY,
+            pinecone_env=PINECONE_ENV,
+            pinecone_index_name=PINECONE_INDEX_NAME
+        )
+        print("\nFinal Response:")
+        print(response)
+    except Exception as e:
+        print(f"An error occurred: {e}")
